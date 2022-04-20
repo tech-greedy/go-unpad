@@ -1,15 +1,23 @@
 package main
 
 import (
+	"errors"
 	"github.com/filecoin-project/go-state-types/abi"
-	"log"
-	"os"
-	"github.com/urfave/cli/v2"
 	"github.com/filecoin-project/lotus/extern/sector-storage/fr32"
 	"github.com/filecoin-project/lotus/extern/sector-storage/partialfile"
+	"github.com/filecoin-project/lotus/extern/sector-storage/storiface"
+	"github.com/urfave/cli/v2"
+	"golang.org/x/xerrors"
+	"io"
+	"log"
+	"os"
 )
 
-func convertPiece(input string, output string, offset int64, length int64) error {
+func unpadded(i storiface.PaddedByteIndex) storiface.UnpaddedByteIndex {
+	return storiface.UnpaddedByteIndex(abi.PaddedPieceSize(i).Unpadded())
+}
+
+func convertPiece(input string, output string, offset storiface.PaddedByteIndex, length abi.UnpaddedPieceSize) error {
 	stat, err := os.Stat(input)
 	if err != nil {
 		return err
@@ -20,7 +28,43 @@ func convertPiece(input string, output string, offset int64, length int64) error
 		ssize = abi.SectorSize(68719476736)
 	}
 	maxPieceSize := abi.PaddedPieceSize(ssize)
-	pf, err := partialfile.OpenPartialFile(maxPieceSize, path.Unsealed)
+	log.Print("open partial file")
+	pf, err := partialfile.OpenPartialFile(maxPieceSize, input)
+	if err != nil {
+		return err
+	}
+	log.Print("check allocation")
+	ok, err := pf.HasAllocated(unpadded(offset), length)
+	if err != nil {
+		_ = pf.Close()
+		return err
+	}
+
+	if !ok {
+		_ = pf.Close()
+		return errors.New("not allocated")
+	}
+
+	log.Print("setup reader")
+	f, err := pf.Reader(offset, length.Padded())
+	if err != nil {
+		_ = pf.Close()
+		return xerrors.Errorf("getting partial file reader: %w", err)
+	}
+
+	log.Print("setup unpad reader")
+	upr, err := fr32.NewUnpadReader(f, length.Padded())
+	if err != nil {
+		return xerrors.Errorf("creating unpadded reader: %w", err)
+	}
+
+	log.Print("open output file")
+	writer, err := os.OpenFile(output, os.O_WRONLY|os.O_CREATE, 0644)
+	defer writer.Close()
+
+	log.Print("copy stream")
+	_, err = io.CopyN(writer, upr, int64(length))
+	return err
 }
 
 func main() {
@@ -29,35 +73,35 @@ func main() {
 		Usage: "unpad the unsealed sector into car file",
 		Flags: []cli.Flag{
 			&cli.StringFlag{
-				Name:    "input",
-				Aliases: []string{"i"},
-				Usage:   "Read unsealed sector file from `INPUT`",
+				Name:     "input",
+				Aliases:  []string{"i"},
+				Usage:    "Read unsealed sector file from `INPUT`",
 				Required: true,
 			},
-			&cli.Int64Flag{
+			&cli.Uint64Flag{
 				Name:  "offset",
 				Usage: "Start position of the deal",
 				Value: 0,
 			},
-			&cli.Int64Flag{
-				Name:  "length",
-				Usage: "length of the deal",
-				Value: int64(32) * 1024 * 1024 * 1024,
+			&cli.Uint64Flag{
+				Name:     "length",
+				Usage:    "length of the deal",
+				Value:    uint64(32) * 1024 * 1024 * 1024,
 				Required: true,
 			},
 			&cli.StringFlag{
-				Name:    "output",
-				Aliases: []string{"o"},
-				Usage:   "Write car file to `OUTPUT`",
+				Name:     "output",
+				Aliases:  []string{"o"},
+				Usage:    "Write car file to `OUTPUT`",
 				Required: true,
 			},
 		},
 		Action: func(c *cli.Context) error {
 			input := c.String("input")
 			output := c.String("output")
-			offset := c.Int64("offset")
-			length := c.Int64("length")
-			err := convertPiece(input, output, offset, length)
+			offset := c.Uint64("offset")
+			length := c.Uint64("length")
+			err := convertPiece(input, output, storiface.PaddedByteIndex(offset), abi.UnpaddedPieceSize(length))
 			return err
 		},
 	}
